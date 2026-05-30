@@ -34,6 +34,10 @@
  .dual .track{position:absolute;top:13px;left:0;right:0;height:4px;background:#0b1220;border-radius:3px;} .dual .fill{position:absolute;top:13px;height:4px;background:var(--accent);border-radius:3px;}
  .toggle{display:flex;gap:6px;} .toggle button{flex:1;background:var(--panel);color:var(--ink);border:1px solid var(--line);padding:7px;border-radius:8px;font-size:12px;cursor:pointer;}
  .toggle button.active{background:var(--accent);border-color:var(--accent);color:#fff;}
+ .drawbtn{background:#0b1220;border:1px solid var(--line);color:var(--ink);border-radius:8px;padding:5px 9px;font-size:12px;cursor:pointer;}
+ .drawbtn.on{background:var(--accent);border-color:var(--accent);color:#fff;}
+ .sbadge{display:inline-block;font-weight:800;padding:2px 9px;border-radius:12px;font-size:12px;color:#06121f;}
+ #safetyHelp{margin-left:auto;cursor:help;text-decoration:underline dotted;}
  .trow{display:flex;align-items:center;gap:8px;font-size:12.5px;padding:3px 2px;cursor:pointer;border-radius:6px;user-select:none;}
  .trow:hover{background:#0b1220;} .trow.off{opacity:.34;} .sw{width:12px;height:12px;border-radius:3px;flex:0 0 auto;} .trow .nm{flex:1;} .trow .ct{color:var(--muted);font-variant-numeric:tabular-nums;}
  .bar{height:6px;background:#0b1220;border-radius:4px;overflow:hidden;margin-top:2px;} .bar>i{display:block;height:100%;}
@@ -53,13 +57,15 @@
    <div id="searchInfo" class="small">Type an address to center the map and count nearby incidents (within the current filters).</div>
   </div>
 
-  <div class="card"><h2>Plan a route (A → B)</h2>
+  <div class="card"><h2>Plan a route &amp; safety score</h2>
    <div class="srch" style="margin-bottom:6px"><input id="rStart" placeholder="start, e.g. Market Place Mall"></div>
-   <div class="srch"><input id="rEnd" placeholder="end, e.g. Main Quad"><button id="rGo">Route</button></div>
+   <div class="srch" style="margin-bottom:6px"><input id="rEnd" placeholder="end, e.g. Main Quad"><button id="rGo">Route</button></div>
+   <div class="rowflex"><button id="rDraw" class="drawbtn">✎ Draw on map</button><span class="small">click 2+ map points</span>
+     <button id="rClear" style="margin-left:auto;background:none;border:1px solid var(--line);color:var(--muted);border-radius:6px;padding:4px 8px;cursor:pointer;">clear</button></div>
    <div class="rowflex">Corridor
      <select id="corridor"><option value="100">100 m</option><option value="150" selected>150 m</option><option value="250">250 m</option></select>
-     <button id="rClear" style="margin-left:auto;background:none;border:1px solid var(--line);color:var(--muted);border-radius:6px;padding:4px 8px;cursor:pointer;">clear</button></div>
-   <div id="routeInfo" class="small">Enter a start and end to draw the street route and count crimes along it (within the current filters).</div>
+     <span class="small" id="safetyHelp" title="Safety score = 100·exp(-risk/30), where risk = (violent per km·yr) + 0.2·(property per km·yr) within the route corridor, under the current filters. Higher = safer. Levels: Low <10, Moderate <25, Elevated <45, High otherwise.">&#9432; how scored</span></div>
+   <div id="routeInfo" class="small">Enter a start &amp; end, or click &#9998; Draw on map, to route and score its safety.</div>
   </div>
 
   <div class="card"><h2>Year</h2>
@@ -130,6 +136,7 @@ let active=new Array(G.length).fill(true);
 let dMin=0, dMax=DATA.maxmin+1, hMin=0, hMax=24;
 let searchPt=null, searchCircle=null, searchMarker=null;
 let routeLine=null, routeLayers=[], corridorM=150;
+let drawMode=false, clickPts=[], clickMk=[];
 
 function passes(i){const r=ROWS[i];if(!active[r[0]])return false;if(r[1]<dMin||r[1]>=dMax)return false;const h=HOUR[i];if(h<hMin||h>=hMax)return false;return true;}
 function currentIdx(){const o=[];for(let i=0;i<ROWS.length;i++)if(passes(i))o.push(i);return o;}
@@ -245,18 +252,37 @@ async function geocode2(q){const vb='-88.50,40.50,-87.80,39.85';
  const j=await (await fetch(url,{headers:{'Accept':'application/json'}})).json();
  return j.length?{lat:+j[0].lat,lon:+j[0].lon,label:(j[0].display_name||q).split(',').slice(0,2).join(',')}:null;}
 const rInfo=document.getElementById('routeInfo');
-function clearRoute(){routeLayers.forEach(l=>map.removeLayer(l));routeLayers=[];routeLine=null;rInfo.innerHTML='Enter a start and end to draw the street route and count crimes along it (within the current filters).';}
+function clearRoute(){routeLayers.forEach(l=>map.removeLayer(l));routeLayers=[];routeLine=null;
+ clickMk.forEach(m=>map.removeLayer(m));clickMk=[];clickPts=[];
+ drawMode=false;const db=document.getElementById('rDraw');if(db)db.classList.remove('on');document.getElementById('map').style.cursor='';
+ rInfo.innerHTML='Enter a start &amp; end, or click &#9998; Draw on map, to route and score its safety.';}
+function safetyLevel(violent,property,lenKm,windowDays){
+ const yf=365/Math.max(1,windowDays), L=Math.max(0.25,lenKm);
+ const vKmYr=violent*yf/L, pKmYr=property*yf/L, risk=vKmYr+0.2*pKmYr;
+ let level,color;
+ if(risk<10){level='Low risk';color='#22c55e';}
+ else if(risk<25){level='Moderate';color='#eab308';}
+ else if(risk<45){level='Elevated';color='#f97316';}
+ else{level='High risk';color='#dc2626';}
+ return {level,color,score:Math.max(0,Math.min(100,Math.round(100*Math.exp(-risk/30)))),vKmYr,pKmYr};}
 function routeStats(idx){if(!routeLine)return;
+ let lenKm=0;for(let i=0;i<routeLine.length-1;i++)lenKm+=haversine(routeLine[i][0],routeLine[i][1],routeLine[i+1][0],routeLine[i+1][1]);lenKm/=1000;
  let mnLa=90,mxLa=-90,mnLo=180,mxLo=-180;for(const p of routeLine){if(p[0]<mnLa)mnLa=p[0];if(p[0]>mxLa)mxLa=p[0];if(p[1]<mnLo)mnLo=p[1];if(p[1]>mxLo)mxLo=p[1];}
  const padLa=corridorM/111320+0.001, padLo=corridorM/MLON+0.001;
  const RX=routeLine.map(p=>locxy(p[0],p[1]));
- const VIO=new Set(['Assault','Robbery','Weapons']);let near=0,viol=0;const gc={};
+ const VIO=new Set(['Assault','Robbery','Weapons']), PRP=new Set(['Theft','Burglary','Vehicle Theft','Vandalism']);
+ let near=0,viol=0,prop=0,vnight=0;const gc={};
  for(const i of idx){const r=ROWS[i],la=r[2],lo=r[3];
   if(la<mnLa-padLa||la>mxLa+padLa||lo<mnLo-padLo||lo>mxLo+padLo)continue;
   const xy=locxy(la,lo);let dm=1e9;for(let s=0;s<RX.length-1;s++){const dd=segDistM(xy[0],xy[1],RX[s],RX[s+1]);if(dd<dm){dm=dd;if(dm<=corridorM)break;}}
-  if(dm<=corridorM){near++;gc[G[r[0]]]=(gc[G[r[0]]]||0)+1;if(VIO.has(G[r[0]]))viol++;}}
- const yf=365/514;const top=Object.entries(gc).sort((a,b)=>b[1]-a[1]).slice(0,5).map(e=>e[0]+' '+e[1]).join(', ');
- rInfo.innerHTML='<b>'+near.toLocaleString()+'</b> crimes within '+corridorM+' m of the route &middot; <b>'+viol+'</b> violent &middot; ~'+Math.round(near*yf)+'/yr'+(top?'<br><span class="small">'+top+'</span>':'');}
+  if(dm<=corridorM){near++;const g=G[r[0]];gc[g]=(gc[g]||0)+1;if(VIO.has(g)){viol++;const h=(ROWS[i][1]%1440)/60|0;if(h>=22||h<6)vnight++;}else if(PRP.has(g))prop++;}}
+ const wd=Math.max(1,Math.round((dMax-dMin)/1440)), yf=365/wd;
+ const s=safetyLevel(viol,prop,lenKm,wd), nightPct=viol?Math.round(100*vnight/viol):0;
+ const top=Object.entries(gc).sort((a,b)=>b[1]-a[1]).slice(0,5).map(e=>e[0]+' '+e[1]).join(', ');
+ rInfo.innerHTML='<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><span class="sbadge" style="background:'+s.color+'">'+s.level+'</span><b style="font-size:13px">Safety '+s.score+'/100</b><span class="small">'+lenKm.toFixed(1)+' km</span></div>'
+  +'<b>'+near.toLocaleString()+'</b> crimes within '+corridorM+' m &middot; <b>'+viol+'</b> violent &middot; ~'+Math.round(near*yf)+'/yr'
+  +'<br><span class="small">'+s.vKmYr.toFixed(1)+' violent &amp; '+s.pKmYr.toFixed(0)+' property per km&middot;yr'+((nightPct>=40&&viol>=5)?' &middot; &#9888; '+nightPct+'% of violent after dark':'')+'</span>'
+  +(top?'<br><span class="small">'+top+'</span>':'');}
 async function planRoute(){const a=document.getElementById('rStart').value.trim(),b=document.getElementById('rEnd').value.trim();
  if(!a||!b){rInfo.textContent='Enter both a start and an end.';return;}
  rInfo.textContent='Geocoding start…';const ga=await geocode2(a);if(!ga){rInfo.textContent='No match for start: '+a;return;}
@@ -276,6 +302,26 @@ document.getElementById('rGo').onclick=planRoute;
 document.getElementById('rEnd').addEventListener('keydown',e=>{if(e.key==='Enter')planRoute();});
 document.getElementById('corridor').onchange=()=>{corridorM=+document.getElementById('corridor').value;if(routeLine)routeStats(currentIdx());};
 document.getElementById('rClear').onclick=clearRoute;
+// point-to-point: click on map to connect a route
+const drawBtn=document.getElementById('rDraw');
+drawBtn.onclick=()=>{drawMode=!drawMode;drawBtn.classList.toggle('on',drawMode);
+ document.getElementById('map').style.cursor=drawMode?'crosshair':'';
+ if(drawMode){clickMk.forEach(m=>map.removeLayer(m));clickMk=[];clickPts=[];routeLayers.forEach(l=>map.removeLayer(l));routeLayers=[];routeLine=null;
+  rInfo.innerHTML='&#9998; <b>Draw mode on</b> — click points on the map to connect a route. Click &#9998; again to stop.';}};
+map.on('click',e=>{if(!drawMode)return;
+ clickPts.push([e.latlng.lat,e.latlng.lng]);const n=clickPts.length;
+ clickMk.push(L.marker([e.latlng.lat,e.latlng.lng],{icon:L.divIcon({className:'',html:'<div style=\"background:#2563eb;color:#fff;width:18px;height:18px;line-height:18px;border-radius:50%;text-align:center;font-weight:700;font-size:11px;border:2px solid #fff\">'+n+'</div>',iconSize:[18,18],iconAnchor:[9,9]})}).addTo(map));
+ if(n>=2)buildClickRoute();else rInfo.innerHTML='Point 1 set — click another point to form a route.';});
+async function buildClickRoute(){rInfo.textContent='Routing '+clickPts.length+' points…';let coords=null;
+ try{const path=clickPts.map(p=>p[1]+','+p[0]).join(';');
+  const u='https://router.project-osrm.org/route/v1/driving/'+path+'?overview=full&geometries=geojson';
+  const jr=await (await fetch(u)).json();if(jr.routes&&jr.routes.length)coords=jr.routes[0].geometry.coordinates.map(c=>[c[1],c[0]]);}catch(e){}
+ let approx=false;if(!coords||coords.length<2){coords=clickPts.slice();approx=true;}
+ routeLayers.forEach(l=>map.removeLayer(l));routeLayers=[];
+ routeLine=coords;corridorM=+document.getElementById('corridor').value;
+ routeLayers.push(L.polyline(coords,{color:'#0b1220',weight:8,opacity:.55}).addTo(map));
+ routeLayers.push(L.polyline(coords,{color:'#22d3ee',weight:4,opacity:.95,dashArray:approx?'6,8':null}).addTo(map));
+ routeStats(currentIdx());}
 
 // init
 document.getElementById('hdrCount').textContent=DATA.meta.n.toLocaleString()+' incidents';
