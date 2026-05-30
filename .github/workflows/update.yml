@@ -1,0 +1,43 @@
+name: Update Champaign County crime map
+
+on:
+  schedule:
+    - cron: '0 11 * * *'      # daily at 11:00 UTC (~6:00 AM US Central)
+  workflow_dispatch: {}        # also allow manual "Run workflow"
+
+permissions:
+  contents: write              # needed to commit the refreshed data back
+
+concurrency:
+  group: update-map
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch latest current-year data from METCAD (Jan 1 -> today)
+        run: python download_champaign_crime.py 2026-01-01 "$(date -u +%F)" 2026
+
+      - name: Rebuild the map
+        run: |
+          python build_combined_map.py
+          cp champaign_crime_combined_map.html index.html
+
+      - name: Commit & push if anything changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add champaign_crime_2026.csv champaign_crime_combined.json champaign_crime_combined_map.html index.html
+          if git diff --staged --quiet; then
+            echo "No data changes today."
+          else
+            git commit -m "Auto-update crime data ($(date -u +%F))"
+            git push
+          fi

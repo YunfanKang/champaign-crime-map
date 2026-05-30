@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+.DS_Store
+champaign_crime___*.csv
