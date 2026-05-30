@@ -129,9 +129,10 @@ TEMPLATE = r"""<!DOCTYPE html>
    <div class="srch" style="margin-bottom:6px"><input id="rEnd" placeholder="end, e.g. Main Quad"><button id="rGo">Route</button></div>
    <div class="rowflex"><button id="rDraw" class="drawbtn">✎ Draw on map</button><span class="small">click 2+ map points</span>
      <button id="rClear" style="margin-left:auto;background:none;border:1px solid var(--line);color:var(--muted);border-radius:6px;padding:4px 8px;cursor:pointer;">clear</button></div>
-   <div class="rowflex">Corridor
-     <select id="corridor"><option value="100">100 m</option><option value="150" selected>150 m</option><option value="250">250 m</option></select>
-     <span class="small" id="safetyHelp" title="Safety score = 100·exp(-risk/30), where risk = (violent per km·yr) + 0.2·(property per km·yr) within the route corridor, under the current filters. Higher = safer. Levels: Low <10, Moderate <25, Elevated <45, High otherwise.">&#9432; how scored</span></div>
+   <div class="rowflex">Mode
+     <select id="rProfile"><option value="foot" selected>Walk</option><option value="bike">Bike</option><option value="driving">Drive</option></select>
+     Corridor <select id="corridor"><option value="100">100 m</option><option value="150" selected>150 m</option><option value="250">250 m</option></select>
+     <span class="small" id="safetyHelp" title="Safety score = 100·exp(-risk/30), risk = violent + 0.2·property per km·YEAR in the corridor. Counts are exposure-normalized by route length × date-span × hour-fraction (so window width does not bias it), and thin samples shrink toward the route's all-time rate. Higher = safer; Low<10, Moderate<25, Elevated<45, High otherwise.">&#9432;</span></div>
    <div id="routeInfo" class="small">Enter a start &amp; end, or click &#9998; Draw on map, to route and score its safety.</div>
   </div>
 
@@ -170,6 +171,7 @@ TEMPLATE = r"""<!DOCTYPE html>
 const DATA = /*__DATA__*/;
 const G=DATA.groups, COL=DATA.colors, CATS=DATA.cats, ROWS=DATA.rows;
 const BASE=Date.UTC(2025,0,1);
+const TOTAL_DAYS=Math.round(DATA.maxmin/1440)+1;
 const VIOLENT=new Set(['Assault','Robbery','Arson','Weapons']);
 function rowDate(min){return new Date(BASE+min*60000);}
 function mins(y,m,d){return Math.round((Date.UTC(y,m,d)-BASE)/60000);}
@@ -224,7 +226,7 @@ function updateStats(idx){
  document.querySelectorAll('.trow').forEach(row=>{const g=+row.dataset.g;row.querySelector('.ct').textContent=gc[g].toLocaleString();row.querySelector('.bar>i').style.width=(100*gc[g]/mx)+'%';});
  drawChart(idx);
  if(searchPt)updateSearchInfo(idx);
- if(routeLine)routeStats(idx);
+ if(routeLine)routeStats();
 }
 function drawChart(idx){
  const cv=document.getElementById('chart');const w=cv.width=cv.clientWidth*2,h=cv.height=128;const x=cv.getContext('2d');x.clearRect(0,0,w,h);
@@ -323,40 +325,47 @@ function clearRoute(){routeLayers.forEach(l=>map.removeLayer(l));routeLayers=[];
  clickMk.forEach(m=>map.removeLayer(m));clickMk=[];clickPts=[];
  drawMode=false;const db=document.getElementById('rDraw');if(db)db.classList.remove('on');document.getElementById('map').style.cursor='';
  rInfo.innerHTML='Enter a start &amp; end, or click &#9998; Draw on map, to route and score its safety.';}
-function safetyLevel(violent,property,lenKm,windowDays){
- const yf=365/Math.max(1,windowDays), L=Math.max(0.25,lenKm);
- const vKmYr=violent*yf/L, pKmYr=property*yf/L, risk=vKmYr+0.2*pKmYr;
- let level,color;
+function scoreFromRisk(risk){let level,color;
  if(risk<10){level='Low risk';color='#22c55e';}
  else if(risk<25){level='Moderate';color='#eab308';}
  else if(risk<45){level='Elevated';color='#f97316';}
  else{level='High risk';color='#dc2626';}
- return {level,color,score:Math.max(0,Math.min(100,Math.round(100*Math.exp(-risk/30)))),vKmYr,pKmYr};}
-function routeStats(idx){if(!routeLine)return;
+ return {level,color,score:Math.max(0,Math.min(100,Math.round(100*Math.exp(-risk/30))))};}
+function routeURL(coordStr){const p=document.getElementById('rProfile').value;
+ if(p==='driving')return 'https://router.project-osrm.org/route/v1/driving/'+coordStr+'?overview=full&geometries=geojson';
+ const host=p==='bike'?'routed-bike':'routed-foot', prof=p==='bike'?'bike':'foot';
+ return 'https://routing.openstreetmap.de/'+host+'/route/v1/'+prof+'/'+coordStr+'?overview=full&geometries=geojson';}
+function routeStats(){if(!routeLine)return;
  let lenKm=0;for(let i=0;i<routeLine.length-1;i++)lenKm+=haversine(routeLine[i][0],routeLine[i][1],routeLine[i+1][0],routeLine[i+1][1]);lenKm/=1000;
  let mnLa=90,mxLa=-90,mnLo=180,mxLo=-180;for(const p of routeLine){if(p[0]<mnLa)mnLa=p[0];if(p[0]>mxLa)mxLa=p[0];if(p[1]<mnLo)mnLo=p[1];if(p[1]>mxLo)mxLo=p[1];}
  const padLa=corridorM/111320+0.001, padLo=corridorM/MLON+0.001;
  const RX=routeLine.map(p=>locxy(p[0],p[1]));
  const VIO=new Set(['Assault','Robbery','Weapons']), PRP=new Set(['Theft','Burglary','Vehicle Theft','Vandalism']);
- let near=0,viol=0,prop=0,vnight=0;const gc={};
- for(const i of idx){const r=ROWS[i],la=r[2],lo=r[3];
+ let near=0,V=0,P=0,vnight=0,V0=0,P0=0;const gc={};
+ for(let i=0;i<ROWS.length;i++){const r=ROWS[i];if(!active[r[0]])continue;const la=r[2],lo=r[3];
   if(la<mnLa-padLa||la>mxLa+padLa||lo<mnLo-padLo||lo>mxLo+padLo)continue;
   const xy=locxy(la,lo);let dm=1e9;for(let s=0;s<RX.length-1;s++){const dd=segDistM(xy[0],xy[1],RX[s],RX[s+1]);if(dd<dm){dm=dd;if(dm<=corridorM)break;}}
-  if(dm<=corridorM){near++;const g=G[r[0]];gc[g]=(gc[g]||0)+1;if(VIO.has(g)){viol++;const h=(ROWS[i][1]%1440)/60|0;if(h>=22||h<6)vnight++;}else if(PRP.has(g))prop++;}}
- const wd=Math.max(1,Math.round((dMax-dMin)/1440)), yf=365/wd;
- const s=safetyLevel(viol,prop,lenKm,wd), nightPct=viol?Math.round(100*vnight/viol):0;
+  if(dm>corridorM)continue;
+  const g=G[r[0]],isV=VIO.has(g),isP=PRP.has(g);if(isV)V0++;else if(isP)P0++;
+  const h=(r[1]%1440)/60|0;
+  if(r[1]>=dMin&&r[1]<dMax&&h>=hMin&&h<hMax){near++;gc[g]=(gc[g]||0)+1;if(isV){V++;if(h>=22||h<6)vnight++;}else if(isP)P++;}}
+ // exposure-normalized densities (route_km x date-years x hour-fraction), shrunk toward the route all-time rate
+ const L=Math.max(0.25,lenKm), dateYrs=(dMax-dMin)/1440/365, hourFrac=Math.max(1/24,(hMax-hMin)/24);
+ const E=Math.max(0.02,L*dateYrs*hourFrac), E0=Math.max(0.02,L*(TOTAL_DAYS/365)), K=0.5;
+ const vDens=(V+K*V0/E0)/(E+K), pDens=(P+K*P0/E0)/(E+K), risk=vDens+0.2*pDens;
+ const s=scoreFromRisk(risk), nightPct=V?Math.round(100*vnight/V):0, lowConf=E<K;
  const top=Object.entries(gc).sort((a,b)=>b[1]-a[1]).slice(0,5).map(e=>e[0]+' '+e[1]).join(', ');
  rInfo.innerHTML='<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px"><span class="sbadge" style="background:'+s.color+'">'+s.level+'</span><b style="font-size:13px">Safety '+s.score+'/100</b><span class="small">'+lenKm.toFixed(1)+' km</span></div>'
-  +'<b>'+near.toLocaleString()+'</b> crimes within '+corridorM+' m &middot; <b>'+viol+'</b> violent &middot; ~'+Math.round(near*yf)+'/yr'
-  +'<br><span class="small">'+s.vKmYr.toFixed(1)+' violent &amp; '+s.pKmYr.toFixed(0)+' property per km&middot;yr'+((nightPct>=40&&viol>=5)?' &middot; &#9888; '+nightPct+'% of violent after dark':'')+'</span>'
+  +'<b>'+near.toLocaleString()+'</b> in corridor &middot; <b>'+V+'</b> violent <span class="small">(this window)</span>'
+  +'<br><span class="small">density: '+vDens.toFixed(1)+' violent &amp; '+pDens.toFixed(0)+' property / km&middot;yr'+((nightPct>=40&&V>=5)?' &middot; &#9888; '+nightPct+'% after dark':'')+'</span>'
+  +(lowConf?'<br><span class="small">&#9432; thin sample in this window &mdash; score blended toward the route overall rate</span>':'')
   +(top?'<br><span class="small">'+top+'</span>':'');}
 async function planRoute(){const a=document.getElementById('rStart').value.trim(),b=document.getElementById('rEnd').value.trim();
  if(!a||!b){rInfo.textContent='Enter both a start and an end.';return;}
  rInfo.textContent='Geocoding start…';const ga=await geocode2(a);if(!ga){rInfo.textContent='No match for start: '+a;return;}
  rInfo.textContent='Geocoding end…';await new Promise(r=>setTimeout(r,1100));const gb=await geocode2(b);if(!gb){rInfo.textContent='No match for end: '+b;return;}
  rInfo.textContent='Routing…';let coords=null;
- try{const u='https://router.project-osrm.org/route/v1/driving/'+ga.lon+','+ga.lat+';'+gb.lon+','+gb.lat+'?overview=full&geometries=geojson';
-  const jr=await (await fetch(u)).json();if(jr.routes&&jr.routes.length)coords=jr.routes[0].geometry.coordinates.map(c=>[c[1],c[0]]);}catch(e){}
+ try{const jr=await (await fetch(routeURL(ga.lon+','+ga.lat+';'+gb.lon+','+gb.lat))).json();if(jr.routes&&jr.routes.length)coords=jr.routes[0].geometry.coordinates.map(c=>[c[1],c[0]]);}catch(e){}
  let approx=false;if(!coords||coords.length<2){coords=[[ga.lat,ga.lon],[gb.lat,gb.lon]];approx=true;}
  clearRoute();routeLine=coords;corridorM=+document.getElementById('corridor').value;
  routeLayers.push(L.polyline(coords,{color:'#0b1220',weight:8,opacity:.55}).addTo(map));
@@ -364,31 +373,34 @@ async function planRoute(){const a=document.getElementById('rStart').value.trim(
  const mk=(la,lo,t,c)=>L.marker([la,lo],{icon:L.divIcon({className:'',html:'<div style=\"background:'+c+';color:#fff;width:22px;height:22px;line-height:22px;border-radius:50%;text-align:center;font-weight:700;border:2px solid #fff;box-shadow:0 0 3px #000\">'+t+'</div>',iconSize:[22,22],iconAnchor:[11,11]})}).addTo(map);
  routeLayers.push(mk(ga.lat,ga.lon,'A','#16a34a'));routeLayers.push(mk(gb.lat,gb.lon,'B','#dc2626'));
  map.fitBounds(routeLayers[0].getBounds(),{padding:[45,45],animate:false});
- routeStats(currentIdx());}
+ routeStats();}
 document.getElementById('rGo').onclick=planRoute;
 document.getElementById('rEnd').addEventListener('keydown',e=>{if(e.key==='Enter')planRoute();});
-document.getElementById('corridor').onchange=()=>{corridorM=+document.getElementById('corridor').value;if(routeLine)routeStats(currentIdx());};
+document.getElementById('corridor').onchange=()=>{corridorM=+document.getElementById('corridor').value;if(routeLine)routeStats();};
+document.getElementById('rProfile').onchange=()=>{const a=document.getElementById('rStart').value.trim(),b=document.getElementById('rEnd').value.trim();if(a&&b)planRoute();else if(clickPts.length>=2)buildClickRoute();};
 document.getElementById('rClear').onclick=clearRoute;
-// point-to-point: click on map to connect a route
+// point-to-point: click map to add a waypoint; click a waypoint to remove it
 const drawBtn=document.getElementById('rDraw');
-drawBtn.onclick=()=>{drawMode=!drawMode;drawBtn.classList.toggle('on',drawMode);
- document.getElementById('map').style.cursor=drawMode?'crosshair':'';
- if(drawMode){clickMk.forEach(m=>map.removeLayer(m));clickMk=[];clickPts=[];routeLayers.forEach(l=>map.removeLayer(l));routeLayers=[];routeLine=null;
-  rInfo.innerHTML='&#9998; <b>Draw mode on</b> — click points on the map to connect a route. Click &#9998; again to stop.';}};
-map.on('click',e=>{if(!drawMode)return;
- clickPts.push([e.latlng.lat,e.latlng.lng]);const n=clickPts.length;
- clickMk.push(L.marker([e.latlng.lat,e.latlng.lng],{icon:L.divIcon({className:'',html:'<div style=\"background:#2563eb;color:#fff;width:18px;height:18px;line-height:18px;border-radius:50%;text-align:center;font-weight:700;font-size:11px;border:2px solid #fff\">'+n+'</div>',iconSize:[18,18],iconAnchor:[9,9]})}).addTo(map));
- if(n>=2)buildClickRoute();else rInfo.innerHTML='Point 1 set — click another point to form a route.';});
+function numIcon(n){return L.divIcon({className:'',html:'<div title="click to remove" style="background:#2563eb;color:#fff;width:20px;height:20px;line-height:20px;border-radius:50%;text-align:center;font-weight:700;font-size:11px;border:2px solid #fff;cursor:pointer">'+n+'</div>',iconSize:[20,20],iconAnchor:[10,10]});}
+function redrawWaypoints(){clickMk.forEach(m=>map.removeLayer(m));clickMk=[];
+ clickPts.forEach((p,i)=>{const m=L.marker(p,{icon:numIcon(i+1)}).addTo(map);
+  m.on('click',ev=>{L.DomEvent.stop(ev);clickPts.splice(i,1);afterEdit();});clickMk.push(m);});}
+function afterEdit(){redrawWaypoints();
+ if(clickPts.length>=2)buildClickRoute();
+ else{routeLayers.forEach(l=>map.removeLayer(l));routeLayers=[];routeLine=null;
+  rInfo.innerHTML=clickPts.length?'1 point set &mdash; click another point (click a point to remove it).':'&#9998; Draw mode &mdash; click points to build a route.';}}
+drawBtn.onclick=()=>{if(!drawMode){clearRoute();drawMode=true;drawBtn.classList.add('on');document.getElementById('map').style.cursor='crosshair';
+  rInfo.innerHTML='&#9998; <b>Draw mode on</b> &mdash; click points to connect a route; click a point to remove it. Click &#9998; again to stop.';}
+ else{drawMode=false;drawBtn.classList.remove('on');document.getElementById('map').style.cursor='';}};
+map.on('click',e=>{if(!drawMode)return;clickPts.push([e.latlng.lat,e.latlng.lng]);afterEdit();});
 async function buildClickRoute(){rInfo.textContent='Routing '+clickPts.length+' points…';let coords=null;
- try{const path=clickPts.map(p=>p[1]+','+p[0]).join(';');
-  const u='https://router.project-osrm.org/route/v1/driving/'+path+'?overview=full&geometries=geojson';
-  const jr=await (await fetch(u)).json();if(jr.routes&&jr.routes.length)coords=jr.routes[0].geometry.coordinates.map(c=>[c[1],c[0]]);}catch(e){}
+ try{const jr=await (await fetch(routeURL(clickPts.map(p=>p[1]+','+p[0]).join(';')))).json();if(jr.routes&&jr.routes.length)coords=jr.routes[0].geometry.coordinates.map(c=>[c[1],c[0]]);}catch(e){}
  let approx=false;if(!coords||coords.length<2){coords=clickPts.slice();approx=true;}
  routeLayers.forEach(l=>map.removeLayer(l));routeLayers=[];
  routeLine=coords;corridorM=+document.getElementById('corridor').value;
  routeLayers.push(L.polyline(coords,{color:'#0b1220',weight:8,opacity:.55}).addTo(map));
  routeLayers.push(L.polyline(coords,{color:'#22d3ee',weight:4,opacity:.95,dashArray:approx?'6,8':null}).addTo(map));
- routeStats(currentIdx());}
+ routeStats();}
 
 // init
 document.getElementById('hdrCount').textContent=DATA.meta.n.toLocaleString()+' incidents';
